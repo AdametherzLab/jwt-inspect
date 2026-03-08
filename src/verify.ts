@@ -200,40 +200,79 @@ function verifySignature(
         return crypto.verify(`RSA-${config.hash.toUpperCase()}`, data, key as crypto.KeyObject, sig);
       }
       case "pss": {
-        return crypto.verify("RSA-PSS", data, {
-          key: key as crypto.KeyObject,
-          padding: crypto.constants.RSA_PKCS1_PSS_PADDING,
-          saltLength: crypto.constants.RSA_PSS_SALTLEN_DIGEST,
-        }, sig);
+        return crypto.verify(
+          `RSA-PSS`, 
+          data, 
+          { key: key as crypto.KeyObject, padding: crypto.constants.RSA_PKCS1_PSS_PADDING, saltLength: crypto.constants.RSA_PSS_SALTLEN_DIGEST }, 
+          sig
+        );
       }
       case "ecdsa": {
-        const curveSize = alg === "ES256" ? 32 : alg === "ES384" ? 48 : 66;
-        const derSig = sig.length === curveSize * 2 ? rawToDer(sig, curveSize) : sig;
-        return crypto.verify(config.hash, data, key as crypto.KeyObject, derSig);
+        // Node.js crypto expects DER-encoded signatures for ECDSA, but JWT uses raw R+S concatenation.
+        // We need to convert the raw signature to DER format.
+        const hashLength = sig.length / 2; // R and S are each half the signature length
+        const r = sig.subarray(0, hashLength);
+        const s = sig.subarray(hashLength);
+
+        // Convert raw R and S to DER-encoded ASN.1 signature
+        const derSignature = toDER(r, s);
+
+        return crypto.verify(config.hash.toUpperCase(), data, key as crypto.KeyObject, derSignature);
       }
+      default:
+        return false;
     }
-  } catch {
+  } catch (e) {
+    // Log or handle specific crypto errors if needed
+    console.error(`Signature verification failed for algorithm ${alg}:`, e);
     return false;
   }
-  return false;
 }
 
-function rawToDer(raw: Buffer, size: number): Buffer {
-  const r = raw.slice(0, size);
-  const s = raw.slice(size);
-  const trim = (b: Buffer) => {
-    let i = 0;
-    while (i < b.length && b[i] === 0) i++;
-    const t = b.slice(i);
-    return t[0] & 0x80 ? Buffer.concat([Buffer.from([0]), t]) : t;
+/**
+ * Converts a raw ECDSA signature (R and S concatenated) into a DER-encoded ASN.1 signature.
+ * This is required for Node.js's `crypto.verify` function for ECDSA.
+ * @param r - The R component of the signature.
+ * @param s - The S component of the signature.
+ * @returns A Buffer containing the DER-encoded signature.
+ */
+function toDER(r: Buffer, s: Buffer): Buffer {
+  // Ensure R and S are positive integers (leading zero if MSB is 1)
+  const r_ = Buffer.concat([Buffer.from([0]), r]);
+  const s_ = Buffer.concat([Buffer.from([0]), s]);
+
+  // Remove leading zeros if not needed (e.g., if the first byte is 0x00 and the second byte's MSB is 0)
+  const trimLeadingZero = (buf: Buffer) => {
+    if (buf.length > 1 && buf[0] === 0x00 && (buf[1] & 0x80) === 0x00) {
+      return buf.subarray(1);
+    }
+    return buf;
   };
-  const rT = trim(r), sT = trim(s);
-  const len = 2 + rT.length + 2 + sT.length;
-  const der = Buffer.alloc(2 + len);
-  der[0] = 0x30; der[1] = len; der[2] = 0x02; der[3] = rT.length;
-  rT.copy(der, 4);
-  der[4 + rT.length] = 0x02;
-  der[4 + rT.length + 1] = sT.length;
-  sT.copy(der, 4 + rT.length + 2);
-  return der;
+
+  const derR = trimLeadingZero(r_);
+  const derS = trimLeadingZero(s_);
+
+  // Construct the DER sequence: SEQUENCE (INTEGER R, INTEGER S)
+  const encodeLength = (len: number) => {
+    if (len < 0x80) {
+      return Buffer.from([len]);
+    } else if (len < 0x100) {
+      return Buffer.from([0x81, len]);
+    } else if (len < 0x10000) {
+      return Buffer.from([0x82, (len >> 8) & 0xFF, len & 0xFF]);
+    } else {
+      throw new Error("Length too large for DER encoding");
+    }
+  };
+
+  const rLen = encodeLength(derR.length);
+  const sLen = encodeLength(derS.length);
+
+  const rSeq = Buffer.concat([Buffer.from([0x02]), rLen, derR]); // 0x02 is INTEGER tag
+  const sSeq = Buffer.concat([Buffer.from([0x02]), sLen, derS]); // 0x02 is INTEGER tag
+
+  const sequence = Buffer.concat([rSeq, sSeq]);
+  const sequenceLen = encodeLength(sequence.length);
+
+  return Buffer.concat([Buffer.from([0x30]), sequenceLen, sequence]); // 0x30 is SEQUENCE tag
 }

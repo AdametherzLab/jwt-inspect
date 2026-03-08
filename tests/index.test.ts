@@ -67,13 +67,40 @@ describe("jwt-inspect public API", () => {
     const signature = signer.sign(privateKey, "base64url");
     const token = `${signingInput}.${signature}`;
 
-    const result = await verifyJwt(token, {
+    const result = await verifyJwt(decodeJwt(token), {
       publicKey,
       algorithms: ["RS256"],
     });
 
     expect(result.valid).toBe(true);
     expect(result.algorithm).toBe("RS256");
+  });
+
+  it("verifyJwt returns valid true for correctly signed ES256 token", async () => {
+    const { privateKey, publicKey } = crypto.generateKeyPairSync("ec", {
+      namedCurve: "P-256",
+      publicKeyEncoding: { type: "spki", format: "pem" },
+      privateKeyEncoding: { type: "pkcs8", format: "pem" },
+    });
+
+    const header = { alg: "ES256", typ: "JWT" };
+    const payload = { sub: "test-user", iat: 1609459200 };
+    const headerB64 = Buffer.from(JSON.stringify(header)).toString("base64url");
+    const payloadB64 = Buffer.from(JSON.stringify(payload)).toString("base64url");
+    const signingInput = `${headerB64}.${payloadB64}`;
+
+    const signer = crypto.createSign("SHA256");
+    signer.update(signingInput);
+    const signature = signer.sign(privateKey, "base64url");
+    const token = `${signingInput}.${signature}`;
+
+    const result = await verifyJwt(decodeJwt(token), {
+      publicKey,
+      algorithms: ["ES256"],
+    });
+
+    expect(result.valid).toBe(true);
+    expect(result.algorithm).toBe("ES256");
   });
 
   it("verifyJwt returns KID_MISMATCH error when JWT kid does not match any JWK kid", async () => {
@@ -96,7 +123,7 @@ describe("jwt-inspect public API", () => {
 
     const jwkWithDifferentKid = { ...publicKey, kid: "wrong-key-id", alg: "RS256" };
 
-    const result = await verifyJwt(token, {
+    const result = await verifyJwt(decodeJwt(token), {
       jwks: [jwkWithDifferentKid],
       algorithms: ["RS256"],
     });
