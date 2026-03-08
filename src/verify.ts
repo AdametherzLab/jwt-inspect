@@ -88,7 +88,7 @@ export function verifyJwt(decoded: DecodedJwt, options: VerificationOptions): Ve
   const keyResult = resolveKey(header, options);
   if (!keyResult.found) return keyResult.error;
 
-  const valid = verifySignature(signingInput, decoded.signature, alg, keyResult.key);
+  const valid = verifySignature(signingInput, decoded.raw.signature, alg, keyResult.key);
   if (!valid) {
     return {
       valid: false, code: "INVALID_SIGNATURE",
@@ -111,16 +111,18 @@ function resolveKey(header: JwtHeader, opts: VerificationOptions): KeyResolution
 
   if (opts.publicKey) {
     try {
+      // Attempt to create a public key from PEM or SPKI format
       return { found: true, key: crypto.createPublicKey(opts.publicKey) };
-    } catch {
+    } catch (e) {
+      // If that fails, try parsing as JWK
       try {
         const jwk = JSON.parse(Buffer.from(opts.publicKey).toString()) as JsonWebKey;
         return { found: true, key: crypto.createPublicKey({ key: jwk, format: "jwk" }) };
-      } catch (e) {
+      } catch (e2) {
         return {
           found: false, error: {
             valid: false, code: "MISSING_KEY",
-            reason: `Invalid key format: ${e instanceof Error ? e.message : "parse error"}`,
+            reason: `Invalid key format: ${e instanceof Error ? e.message : "parse error"} or ${e2 instanceof Error ? e2.message : "parse error"}`,
           } satisfies MissingKeyError,
         };
       }
@@ -177,7 +179,7 @@ function resolveKey(header: JwtHeader, opts: VerificationOptions): KeyResolution
   };
 }
 
-function verifySignature(
+export function verifySignature(
   input: string, 
   signature: Base64UrlString, 
   alg: string, 
@@ -199,80 +201,41 @@ function verifySignature(
       case "rsa": {
         return crypto.verify(`RSA-${config.hash.toUpperCase()}`, data, key as crypto.KeyObject, sig);
       }
+      case "ecdsa": {
+        // Node.js crypto.verify for ECDSA expects the signature to be in DER format.
+        // JWT ES256 signatures are r||s (concatenation of r and s values).
+        // We need to convert r||s to DER format for verification.
+        // r and s are 32 bytes each for ES256 (P-256 curve).
+        const r = sig.subarray(0, sig.length / 2);
+        const s = sig.subarray(sig.length / 2);
+
+        // Construct DER sequence: SEQUENCE (INTEGER r, INTEGER s)
+        const derSig = Buffer.concat([
+          Buffer.from([0x30]), // SEQUENCE
+          Buffer.from([r.length + s.length + 4]), // Length of sequence content
+          Buffer.from([0x02]), // INTEGER
+          Buffer.from([r.length]), // Length of r
+          r,
+          Buffer.from([0x02]), // INTEGER
+          Buffer.from([s.length]), // Length of s
+          s,
+        ]);
+
+        return crypto.verify(config.hash.toUpperCase(), data, key as crypto.KeyObject, derSig);
+      }
       case "pss": {
         return crypto.verify(
-          `RSA-PSS`, 
-          data, 
-          { key: key as crypto.KeyObject, padding: crypto.constants.RSA_PKCS1_PSS_PADDING, saltLength: crypto.constants.RSA_PSS_SALTLEN_DIGEST }, 
+          config.hash.toUpperCase(),
+          data,
+          { key: key as crypto.KeyObject, padding: crypto.constants.RSA_PKCS1_PSS_PADDING },
           sig
         );
-      }
-      case "ecdsa": {
-        // Node.js crypto expects DER-encoded signatures for ECDSA, but JWT uses raw R+S concatenation.
-        // We need to convert the raw signature to DER format.
-        const hashLength = sig.length / 2; // R and S are each half the signature length
-        const r = sig.subarray(0, hashLength);
-        const s = sig.subarray(hashLength);
-
-        // Convert raw R and S to DER-encoded ASN.1 signature
-        const derSignature = toDER(r, s);
-
-        return crypto.verify(config.hash.toUpperCase(), data, key as crypto.KeyObject, derSignature);
       }
       default:
         return false;
     }
   } catch (e) {
-    // Log or handle specific crypto errors if needed
-    console.error(`Signature verification failed for algorithm ${alg}:`, e);
+    console.error("Signature verification error:", e);
     return false;
   }
-}
-
-/**
- * Converts a raw ECDSA signature (R and S concatenated) into a DER-encoded ASN.1 signature.
- * This is required for Node.js's `crypto.verify` function for ECDSA.
- * @param r - The R component of the signature.
- * @param s - The S component of the signature.
- * @returns A Buffer containing the DER-encoded signature.
- */
-function toDER(r: Buffer, s: Buffer): Buffer {
-  // Ensure R and S are positive integers (leading zero if MSB is 1)
-  const r_ = Buffer.concat([Buffer.from([0]), r]);
-  const s_ = Buffer.concat([Buffer.from([0]), s]);
-
-  // Remove leading zeros if not needed (e.g., if the first byte is 0x00 and the second byte's MSB is 0)
-  const trimLeadingZero = (buf: Buffer) => {
-    if (buf.length > 1 && buf[0] === 0x00 && (buf[1] & 0x80) === 0x00) {
-      return buf.subarray(1);
-    }
-    return buf;
-  };
-
-  const derR = trimLeadingZero(r_);
-  const derS = trimLeadingZero(s_);
-
-  // Construct the DER sequence: SEQUENCE (INTEGER R, INTEGER S)
-  const encodeLength = (len: number) => {
-    if (len < 0x80) {
-      return Buffer.from([len]);
-    } else if (len < 0x100) {
-      return Buffer.from([0x81, len]);
-    } else if (len < 0x10000) {
-      return Buffer.from([0x82, (len >> 8) & 0xFF, len & 0xFF]);
-    } else {
-      throw new Error("Length too large for DER encoding");
-    }
-  };
-
-  const rLen = encodeLength(derR.length);
-  const sLen = encodeLength(derS.length);
-
-  const rSeq = Buffer.concat([Buffer.from([0x02]), rLen, derR]); // 0x02 is INTEGER tag
-  const sSeq = Buffer.concat([Buffer.from([0x02]), sLen, derS]); // 0x02 is INTEGER tag
-
-  const sequence = Buffer.concat([rSeq, sSeq]);
-  const sequenceLen = encodeLength(sequence.length);
-
-  return Buffer.concat([Buffer.from([0x30]), sequenceLen, sequence]); // 0x30 is SEQUENCE tag
 }
